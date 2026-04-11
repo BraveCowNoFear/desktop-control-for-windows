@@ -1,0 +1,5 @@
+pyautogui
+Pillow
+pygetwindow
+pyperclip
+opencv-python
