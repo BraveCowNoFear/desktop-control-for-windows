@@ -1,6 +1,6 @@
 ---
 name: desktop-control-for-windows
-description: Windows desktop UI automation for Codex using a UI-worker-isolated local-control workflow with real keyboard, mouse, screenshot, window, clipboard, image matching, scrolling, dragging, long-press, and batch plans. Use when Codex needs to operate Windows applications or websites through visible UI because no reliable API, DOM, CLI, or accessibility interface is available; when the task asks to click, type, drag, scroll, hold keys/buttons, inspect the screen, control a computer, automate desktop software, or interact with closed-source Windows UI. For live screen work, any non-UI-worker agent at any task depth may act as the coordinator and must delegate screenshots, image inspection, and UI execution to exactly one dedicated UI worker. If delegation is unavailable or disallowed, the coordinator must stop and ask for permission instead of running screenshot or UI-control commands itself. A delegated UI worker is a leaf worker and must not create another agent.
+description: Windows desktop UI automation for Codex using a UI-worker-isolated local-control workflow with real keyboard, mouse, screenshot, window, clipboard, image matching, scrolling, dragging, long-press, and batch plans. Use when Codex needs to operate Windows applications or websites through visible UI because no reliable API, DOM, CLI, or accessibility interface is available; when the task asks to click, type, drag, scroll, hold keys/buttons, inspect the screen, control a computer, automate desktop software, or interact with closed-source Windows UI. For live screen work, any non-UI-worker agent at any task depth may act as the coordinator and must delegate screenshots, image inspection, and UI execution to exactly one dedicated UI worker. When agent delegation tools are available, using this skill is sufficient authorization to create that UI worker; do not ask the user for a passphrase or extra UI-worker permission. A delegated UI worker is a leaf worker and must not create another agent.
 ---
 
 # Desktop Control for Windows
@@ -11,10 +11,10 @@ Use this skill to operate visible Windows UI like a fast human: screenshot, reas
 
 This skill has two roles:
 
-- Coordinator: any agent at any depth that is not already the UI worker, decides whether visible UI control is needed, delegates one bounded UI task to a worker when delegation is available, and pauses for explicit permission when delegation is unavailable.
+- Coordinator: any agent at any depth that is not already the UI worker, decides whether visible UI control is needed, delegates one bounded UI task to a worker when delegation is available, and reports a tool/policy blocker only when delegation is genuinely unavailable.
 - UI worker: the already-delegated agent that takes screenshots, inspects pixels, and runs `scripts/ui_control.py` directly.
 
-Mandatory delegation gate: for any live Windows UI-control task, first decide your role from the prompt you were given. If you were not explicitly spawned as the UI worker/screen-control worker for this UI task, you are the coordinator even if you are already a subagent of a larger task. Do not take screenshots, view screenshots, call `scripts/ui_control.py`, or inspect live screen images yourself. Delegate exactly one dedicated UI worker. If the current runtime policy or tool availability prevents delegation, stop before touching the UI and ask the user to explicitly authorize a UI worker or choose a non-UI path. Only skip delegation when you are already the UI worker or when you are debugging/editing this skill itself.
+Mandatory delegation gate: for any live Windows UI-control task, first decide your role from the prompt you were given. If you were not explicitly spawned as the UI worker/screen-control worker for this UI task, you are the coordinator even if you are already a subagent of a larger task. Do not take screenshots, view screenshots, call `scripts/ui_control.py`, or inspect live screen images yourself. Delegate exactly one dedicated UI worker. When `spawn_agent` or an equivalent delegation tool is available, the active use of this skill is the authorization to create the worker; do not ask the user to send a magic word, passphrase, or extra confirmation. Only skip delegation when you are already the UI worker or when you are debugging/editing this skill itself.
 
 Never allow recursive UI-worker delegation. Ordinary task agents can be nested two or three levels deep and still create one dedicated UI worker for their own visible-UI phase. The leaf UI worker itself must not spawn, delegate to, message, or wait on any additional agent. Do the UI work locally with the bundled script and return a concise text report.
 
@@ -34,7 +34,7 @@ Intentionally not copied: the upstream demo scripts and rule-based `ai_agent.py`
 
 For every real UI-control task, the coordinator must delegate to one single UI worker whenever the current runtime policy allows agent delegation. The worker performs screenshots, visual inspection, and UI execution. The coordinator must not take screenshots, view screenshots, run `scripts/ui_control.py`, or inspect screen images itself unless debugging the skill implementation. This keeps screen pixels, private window content, and visual reasoning out of the main conversation context.
 
-No-direct-control fallback: if the coordinator cannot spawn or message a UI worker because the runtime policy, tool availability, or user permissions do not allow delegation, it must pause and ask the user for explicit permission to use a UI worker. It must not continue by doing local screenshot/image-inspection/UI-control work in its own context.
+No-direct-control fallback: if the coordinator cannot spawn or message a UI worker because the runtime policy or tool availability truly prevents delegation, it must stop before touching the UI and report that blocker. Do not ask the user for a ritual authorization phrase; that does not create missing tools or override runtime policy. It must not continue by doing local screenshot/image-inspection/UI-control work in its own context.
 
 If you are already inside a delegated UI worker context, skip this protocol and follow **UI Worker Protocol** below. Do not call `spawn_agent`, `send_input`, `wait_agent`, `close_agent`, OpenSpace delegation tools, or any equivalent nested-worker mechanism.
 
@@ -87,7 +87,7 @@ Worker loop:
 
 ## Local Control
 
-This section is for UI workers and skill debugging only. A coordinator must not run these commands for a live UI task; it must delegate to one UI worker first or pause if delegation is unavailable.
+This section is for UI workers and skill debugging only. A coordinator must not run these commands for a live UI task; it must delegate to one UI worker first or report the delegation blocker if delegation is unavailable.
 
 Run from the skill directory:
 

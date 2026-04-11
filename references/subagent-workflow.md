@@ -2,7 +2,7 @@
 
 Use this workflow for real Windows UI automation. Any non-UI-worker agent, including a subagent two or three levels deep inside a larger task, may act as the coordinator. The coordinator must delegate screenshot-taking, image inspection, and UI execution to exactly one dedicated UI worker so its own context stays clean. The UI worker is a leaf: it must never create another worker or subagent.
 
-Mandatory gate: for live Windows UI control, first decide your role from the prompt you were given. If you were not explicitly spawned as the UI worker/screen-control worker for this UI task, you are the coordinator even if you are already a subagent of a larger task. The coordinator must not run screenshot commands, inspect screen images, or call `scripts/ui_control.py` itself. It must spawn/message exactly one UI worker. If the current runtime cannot delegate, the coordinator must pause and ask the user to explicitly authorize a UI worker or choose a non-UI path instead of falling back to direct UI control.
+Mandatory gate: for live Windows UI control, first decide your role from the prompt you were given. If you were not explicitly spawned as the UI worker/screen-control worker for this UI task, you are the coordinator even if you are already a subagent of a larger task. The coordinator must not run screenshot commands, inspect screen images, or call `scripts/ui_control.py` itself. It must spawn/message exactly one UI worker. When `spawn_agent` or an equivalent delegation tool is available, using this skill is sufficient authorization to create the worker. If the current runtime truly cannot delegate, the coordinator must stop and report that blocker instead of falling back to direct UI control or asking the user for a magic authorization phrase.
 
 Global UI lock: all UI workers serialize live desktop access through `scripts/ui_control.py lock acquire/release`. A worker must hold this lock across its whole screenshot/act/verify loop and pass `--lock-token` to every non-dry-run UI command. If the lock is busy, the worker should wait within its timeout or return `partial`; it must not compete for the mouse, keyboard, foreground window, or clipboard.
 
@@ -17,7 +17,7 @@ Locale-sensitive search: before searching for a named UI target, the UI worker m
 - Tell the UI worker explicitly to acquire the global UI lock before touching the desktop, pass `--lock-token` to every command, and release the lock before returning.
 - Tell the UI worker explicitly to inspect the visible UI language before choosing a search term; use `--decode-unicode-escapes` for Chinese UI and English/ASCII aliases only for English UI.
 - Do not personally call screenshot/image-viewing/UI-control commands for the live UI task.
-- If delegation is unavailable or disallowed, stop and ask the user for explicit UI-worker authorization instead of doing the UI work in the main context.
+- If delegation is unavailable or disallowed by missing tools or runtime policy, stop and report the blocker instead of doing the UI work in the main context. Do not ask the user for a passphrase or extra UI-worker authorization.
 - Wait for the subagent's final text report, then decide whether another subagent pass is needed.
 - If the user asks to approve a high-risk action, the coordinator makes that decision with the user before delegating.
 

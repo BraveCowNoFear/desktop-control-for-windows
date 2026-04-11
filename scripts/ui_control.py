@@ -79,7 +79,7 @@ def emit(result: dict[str, Any]) -> int:
 
 def lock_record_public(record: dict[str, Any]) -> dict[str, Any]:
     token = str(record.get("token") or "")
-    public = {key: value for key, value in record.items() if key != "token"}
+    public = {key: value for key, value in record.items() if key != "token" and not key.startswith("_")}
     if token:
         public["tokenHash"] = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
     public["lockFile"] = str(LOCK_FILE)
@@ -188,12 +188,15 @@ def ui_lock_for_command(args: argparse.Namespace) -> Iterator[dict[str, Any] | N
     timeout = max(float(getattr(args, "lock_timeout", DEFAULT_LOCK_TIMEOUT_SECONDS) or 0), 0.0)
     owner = getattr(args, "lock_owner", None) or f"pid:{os.getpid()} command:{getattr(args, 'command', 'unknown')}"
     record = acquire_ui_lock(timeout, ttl, owner)
+    record["_transient"] = True
     try:
         yield record
     finally:
         try:
-            release_ui_lock(str(record["token"]))
+            release_result = release_ui_lock(str(record["token"]))
+            record["_released"] = bool(release_result.get("released"))
         except Exception:
+            record["_released"] = False
             pass
 
 
@@ -227,7 +230,20 @@ def parse_region(values: list[int] | None) -> tuple[int, int, int, int] | None:
         return None
     if len(values) != 4:
         raise ValueError("region must be: left top width height")
-    return tuple(values)  # type: ignore[return-value]
+    left, top, width, height = values
+    if width <= 0 or height <= 0:
+        raise ValueError("region width and height must be positive")
+    return (left, top, width, height)
+
+
+def require_non_negative(value: float, name: str) -> None:
+    if value < 0:
+        raise RuntimeError(f"{name} must be non-negative")
+
+
+def require_positive_int(value: int, name: str) -> None:
+    if value < 1:
+        raise RuntimeError(f"{name} must be at least 1")
 
 
 def require_pair(x: int | None, y: int | None, name: str = "coordinates") -> None:
@@ -370,10 +386,11 @@ def command_pixel(args: argparse.Namespace) -> dict[str, Any]:
 def command_move(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
-    if args.dry_run:
-        return ok(action="move", x=args.x, y=args.y, relative=args.relative, dryRun=True)
+    require_non_negative(args.duration, "duration")
     if not args.relative:
         check_point_bounds(args, args.x, args.y)
+    if args.dry_run:
+        return ok(action="move", x=args.x, y=args.y, relative=args.relative, dryRun=True)
     confirm_action(args, f"move mouse to ({args.x}, {args.y}), relative={args.relative}")
     if args.relative:
         pyautogui.move(args.x, args.y, duration=args.duration)
@@ -387,6 +404,8 @@ def command_click(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_positive_int(args.clicks, "clicks")
+    require_non_negative(args.interval, "interval")
     if args.x is not None and args.y is not None:
         check_point_bounds(args, args.x, args.y)
     if args.dry_run:
@@ -408,6 +427,7 @@ def command_mouse_button(args: argparse.Namespace, is_down: bool) -> dict[str, A
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_non_negative(args.duration, "duration")
     if args.x is not None and args.y is not None:
         check_point_bounds(args, args.x, args.y)
     action = "mouse-down" if is_down else "mouse-up"
@@ -428,6 +448,8 @@ def command_hold_mouse(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_non_negative(args.seconds, "seconds")
+    require_non_negative(args.duration, "duration")
     if args.x is not None and args.y is not None:
         check_point_bounds(args, args.x, args.y)
     if args.dry_run:
@@ -447,6 +469,10 @@ def command_hold_mouse(args: argparse.Namespace) -> dict[str, Any]:
 def command_drag(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
+    require_non_negative(args.duration, "duration")
+    require_non_negative(args.move_duration, "move-duration")
+    check_point_bounds(args, args.start_x, args.start_y)
+    check_point_bounds(args, args.end_x, args.end_y)
     if args.dry_run:
         return ok(
             action="drag",
@@ -455,8 +481,6 @@ def command_drag(args: argparse.Namespace) -> dict[str, Any]:
             button=args.button,
             dryRun=True,
         )
-    check_point_bounds(args, args.start_x, args.start_y)
-    check_point_bounds(args, args.end_x, args.end_y)
     confirm_action(args, f"drag from ({args.start_x}, {args.start_y}) to ({args.end_x}, {args.end_y})")
     try:
         pyautogui.moveTo(args.start_x, args.start_y, duration=args.move_duration)
@@ -509,7 +533,7 @@ def read_text_input(args: argparse.Namespace) -> str:
     if args.stdin:
         text = sys.stdin.read()
     elif args.file:
-        text = Path(args.file).read_text(encoding="utf-8-sig")
+        text = Path(args.file).expanduser().read_text(encoding="utf-8-sig")
     else:
         text = args.text
     if getattr(args, "decode_unicode_escapes", False):
@@ -525,8 +549,13 @@ def command_type(args: argparse.Namespace) -> dict[str, Any]:
     if method == "auto":
         method = "paste" if text_needs_paste(text) else "keys"
     if args.wpm:
+        require_positive_int(args.wpm, "wpm")
         chars_per_second = max((args.wpm * 5) / 60, 1)
         args.interval = 1.0 / chars_per_second
+    require_non_negative(args.interval, "interval")
+    require_non_negative(args.restore_delay, "restore-delay")
+    if method == "keys" and any(ord(ch) > 127 for ch in text):
+        raise RuntimeError("method=keys cannot type non-ASCII text reliably; use --method paste")
     if args.dry_run:
         return ok(action="type", method=method, chars=len(text), dryRun=True)
     confirm_action(args, f"type {len(text)} chars using {method}")
@@ -556,6 +585,8 @@ def command_type(args: argparse.Namespace) -> dict[str, Any]:
 def command_press(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
+    require_positive_int(args.presses, "presses")
+    require_non_negative(args.interval, "interval")
     if args.dry_run:
         return ok(action="press", key=args.key, presses=args.presses, dryRun=True)
     confirm_action(args, f"press key {args.key} x{args.presses}")
@@ -567,6 +598,7 @@ def command_press(args: argparse.Namespace) -> dict[str, Any]:
 def command_hotkey(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
+    require_non_negative(args.interval, "interval")
     if args.dry_run:
         return ok(action="hotkey", keys=args.keys, dryRun=True)
     confirm_action(args, f"hotkey {'+'.join(args.keys)}")
@@ -593,6 +625,7 @@ def command_key_state(args: argparse.Namespace, is_down: bool) -> dict[str, Any]
 def command_key_hold(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
+    require_non_negative(args.seconds, "seconds")
     if args.dry_run:
         return ok(action="key-hold", key=args.key, seconds=args.seconds, dryRun=True)
     confirm_action(args, f"hold key {args.key} for {args.seconds}s")
@@ -782,6 +815,7 @@ def execute_plan_action(action: dict[str, Any], base_args: argparse.Namespace) -
         "click": command_click,
         "double-click": lambda a: (setattr(a, "clicks", 2), command_click(a))[1],
         "right-click": lambda a: (setattr(a, "button", "right"), command_click(a))[1],
+        "middle-click": lambda a: (setattr(a, "button", "middle"), command_click(a))[1],
         "drag": command_drag,
         "scroll": command_scroll,
         "type": command_type,
@@ -799,6 +833,7 @@ def execute_plan_action(action: dict[str, Any], base_args: argparse.Namespace) -
     }
     if cmd == "sleep":
         seconds = float(action.get("seconds", 0))
+        require_non_negative(seconds, "seconds")
         if not base_args.dry_run:
             time.sleep(seconds)
         return ok(action="sleep", seconds=seconds, dryRun=base_args.dry_run)
@@ -809,7 +844,7 @@ def execute_plan_action(action: dict[str, Any], base_args: argparse.Namespace) -
 
 def command_plan(args: argparse.Namespace) -> dict[str, Any]:
     if args.plan_file:
-        raw = Path(args.plan_file).read_text(encoding="utf-8-sig")
+        raw = Path(args.plan_file).expanduser().read_text(encoding="utf-8-sig")
     else:
         raw = args.plan_json
     actions = json.loads(raw)
@@ -826,7 +861,11 @@ def command_plan(args: argparse.Namespace) -> dict[str, Any]:
                 results.append(fail("plan action must be an object", index=idx))
                 failed = True
                 break
-            result = execute_plan_action(action, args)
+            try:
+                result = execute_plan_action(action, args)
+            except Exception as exc:
+                result = fail(str(exc), action=action)
+                failed = True
             result["index"] = idx
             results.append(result)
             cmd = action.get("command")
@@ -1096,10 +1135,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        lock_record = None
         with ui_lock_for_command(args) as lock_record:
             result = args.func(args)
-            if lock_record is not None and result.get("ok"):
-                result["uiLock"] = lock_record_public(lock_record)
+        if lock_record is not None and result.get("ok"):
+            ui_lock = lock_record_public(lock_record)
+            if lock_record.get("_transient"):
+                ui_lock["scope"] = "transient-command"
+                ui_lock["released"] = bool(lock_record.get("_released"))
+            else:
+                ui_lock["scope"] = "provided-token"
+                ui_lock["released"] = False
+            result["uiLock"] = ui_lock
     except Exception as exc:
         result = fail(str(exc), command=getattr(args, "command", None))
     try:

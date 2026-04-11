@@ -27,6 +27,7 @@ python scripts\ui_control.py --lock-token <token> <command> ...
 - Commands automatically use a global UI lock so parallel workers do not fight over the mouse, keyboard, foreground window, or clipboard.
 - For multi-command UI phases, run `lock acquire` first, then pass `--lock-token <token>` to every non-dry-run command, and release the lock at the end.
 - Use `--lock-timeout` to control how long a command waits for another worker's lock. Expired locks are treated as stale and removed automatically.
+- Single commands that acquire their own transient lock include `uiLock.scope: "transient-command"` and `uiLock.released: true` after the command completes. Commands run with a worker-provided token include `uiLock.scope: "provided-token"` and leave release responsibility with the worker.
 
 ## Global UI Lock
 
@@ -140,4 +141,4 @@ python scripts\ui_control.py --lock-token <token> plan --file C:\path\actions.js
 
 On PowerShell, prefer `plan --file` for JSON actions. Passing complex JSON through `plan --json` can be mangled by native-command argument parsing and should be reserved for very small ASCII-only snippets after a dry-run check.
 
-Supported plan commands: `move`, `click`, `double-click`, `right-click`, `drag`, `scroll`, `type`, `press`, `hotkey`, `key-down`, `key-up`, `key-hold`, `mouse-down`, `mouse-up`, `hold-mouse`, `clipboard-set`, `window-activate`, `screenshot`, and `sleep`. If any sub-action fails, the plan returns `ok:false` and releases tracked held keys/buttons.
+Supported plan commands: `move`, `click`, `double-click`, `right-click`, `middle-click`, `drag`, `scroll`, `type`, `press`, `hotkey`, `key-down`, `key-up`, `key-hold`, `mouse-down`, `mouse-up`, `hold-mouse`, `clipboard-set`, `window-activate`, `screenshot`, and `sleep`. If any sub-action fails or raises an exception, the plan returns `ok:false` with the failing action index and releases tracked held keys/buttons.
