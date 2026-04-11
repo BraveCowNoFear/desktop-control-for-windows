@@ -48,11 +48,17 @@ python scripts\ui_control.py lock release --token <token>
 python scripts\ui_control.py --lock-token <token> status --windows
 python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\screen.png"
 python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\region.png" --region 100 100 800 500
+python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\active.png" --active
+python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\chrome.png" --window "Chrome"
+python scripts\ui_control.py --lock-token <token> snapshot --out "$env:TEMP\state.png" --windows --active
 python scripts\ui_control.py --lock-token <token> pixel 500 300
 python scripts\ui_control.py --lock-token <token> find-image C:\path\button.png --confidence 0.85
+python scripts\ui_control.py --lock-token <token> find-image C:\path\button.png --active
+python scripts\ui_control.py --lock-token <token> find-image C:\path\button.png --window "Notepad"
 ```
 
 `status --windows` lists titled windows and the current active window, including minimized or off-screen windows when the platform reports them. `find-image` returns the match box and center when the template is found.
+Use `snapshot` instead of separate `status --windows` and `screenshot` calls when a worker needs both metadata and an image. Use `--active` or `--window` instead of a full-screen screenshot/search when the target app is already known. The controller converts the selected window rectangle into the region passed to PyAutoGUI and includes `target` metadata in the JSON result. On Windows, maximized windows can report invisible border offsets; window targets are clamped to the primary screen and the original rectangle is retained as `target.requestedRegion`.
 
 Solid-color templates are matched with an exact-pixel path instead of confidence matching, because normalized template matching can report false positives for zero-variance images. For single-pixel color checks, prefer `pixel`.
 
@@ -129,7 +135,7 @@ For fast repeated UI operations, create a JSON file:
   {"command": "type", "text": "\\u6587\\u4ef6\\u4f20\\u8f93\\u52a9\\u624b", "decode-unicode-escapes": true, "method": "paste"},
   {"command": "press", "key": "enter"},
   {"command": "sleep", "seconds": 1.0},
-  {"command": "screenshot", "out": "C:\\Temp\\after.png"}
+  {"command": "snapshot", "out": "C:\\Temp\\after.png", "windows": true, "active": true}
 ]
 ```
 
@@ -141,4 +147,6 @@ python scripts\ui_control.py --lock-token <token> plan --file C:\path\actions.js
 
 On PowerShell, prefer `plan --file` for JSON actions. Passing complex JSON through `plan --json` can be mangled by native-command argument parsing and should be reserved for very small ASCII-only snippets after a dry-run check.
 
-Supported plan commands: `move`, `click`, `double-click`, `right-click`, `middle-click`, `drag`, `scroll`, `type`, `press`, `hotkey`, `key-down`, `key-up`, `key-hold`, `mouse-down`, `mouse-up`, `hold-mouse`, `clipboard-set`, `window-activate`, `screenshot`, and `sleep`. If any sub-action fails or raises an exception, the plan returns `ok:false` with the failing action index and releases tracked held keys/buttons.
+Plan actions may set only action-specific fields. They cannot override global/control fields such as `dry-run`, `require-approval`, `no-failsafe`, `strict-bounds`, `pause-after`, `log-file`, `lock-token`, `lock-timeout`, `lock-ttl`, `lock-owner`, `plan-file`, `plan-json`, `func`, or `stdin`. For plan text input, use a `text` value or `file`; do not make a plan sub-action read from process stdin. Plan-supplied choices and booleans are validated the same way direct CLI arguments are validated.
+
+Supported plan commands: `move`, `click`, `double-click`, `right-click`, `middle-click`, `drag`, `scroll`, `type`, `press`, `hotkey`, `key-down`, `key-up`, `key-hold`, `mouse-down`, `mouse-up`, `hold-mouse`, `clipboard-set`, `window-activate`, `screenshot`, `snapshot`, `find-image`, and `sleep`. If any sub-action fails or raises an exception, the plan returns `ok:false` with the failing action index and releases tracked held keys/buttons.

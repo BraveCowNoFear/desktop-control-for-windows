@@ -22,6 +22,7 @@ Recommended defaults:
 - Use the global UI lock for multi-step tasks.
 - Use `--dry-run` for generated plans.
 - Use `--require-approval` for risky manual tests.
+- Keep plan JSON limited to action-specific fields; global safety and lock options belong on the command line, not inside individual plan actions.
 - Avoid secrets, payments, UAC prompts, password managers, banking flows, and destructive actions unless the user explicitly requested the exact action.
 
 The bundled controller is local-only. `scripts/ui_control.py` does not call external network services.
@@ -57,12 +58,16 @@ Run commands from the skill directory:
 python scripts\ui_control.py lock acquire --owner "example"
 python scripts\ui_control.py --lock-token <token> status --windows
 python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\screen.png"
+python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\active.png" --active
+python scripts\ui_control.py --lock-token <token> snapshot --out "$env:TEMP\state.png" --windows --active
+python scripts\ui_control.py --lock-token <token> find-image C:\path\button.png --window "Chrome"
 python scripts\ui_control.py --lock-token <token> hotkey ctrl l
 python scripts\ui_control.py --lock-token <token> type "hello world" --method paste
 python scripts\ui_control.py lock release --token <token>
 ```
 
 Global options such as `--lock-token`, `--dry-run`, and `--require-approval` must appear before the subcommand.
+Use `snapshot` when a worker needs both status metadata and a screenshot in one call. Use `--active` or `--window` on screenshots, snapshots, and image search when the target app is known; it avoids full-screen capture/matching and keeps visual loops smaller.
 
 ## Provenance
 

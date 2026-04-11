@@ -48,6 +48,8 @@ LOCK_POLL_SECONDS = 0.2
 LOCK_FILE = Path(
     os.environ.get("CODEX_UI_CONTROL_LOCK_FILE", str(Path(tempfile.gettempdir()) / "codex-ui-control.lock.json"))
 )
+VALID_MOUSE_BUTTONS = {"left", "right", "middle"}
+VALID_TYPE_METHODS = {"auto", "keys", "paste"}
 
 
 def import_pyautogui():
@@ -246,6 +248,17 @@ def require_positive_int(value: int, name: str) -> None:
         raise RuntimeError(f"{name} must be at least 1")
 
 
+def require_bool(value: bool, name: str) -> None:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{name} must be a JSON boolean")
+
+
+def require_choice(value: str, name: str, choices: set[str]) -> None:
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise RuntimeError(f"{name} must be one of: {allowed}")
+
+
 def require_pair(x: int | None, y: int | None, name: str = "coordinates") -> None:
     if (x is None) != (y is None):
         raise RuntimeError(f"{name} require both x and y, or neither")
@@ -293,12 +306,16 @@ def get_windows() -> list[dict[str, Any]]:
     return windows
 
 
-def active_window() -> dict[str, Any] | None:
+def active_window_object():
     try:
         import pygetwindow as gw
     except Exception as exc:
         raise RuntimeError("pygetwindow is required for window commands") from exc
-    win = gw.getActiveWindow()
+    return gw.getActiveWindow()
+
+
+def active_window() -> dict[str, Any] | None:
+    win = active_window_object()
     return window_info(win) if win else None
 
 
@@ -325,6 +342,73 @@ def window_info(win) -> dict[str, Any]:
         "isActive": getattr(win, "isActive", None),
         "isMinimized": getattr(win, "isMinimized", None),
         "isMaximized": getattr(win, "isMaximized", None),
+    }
+
+
+def window_region(info: dict[str, Any]) -> tuple[int, int, int, int]:
+    try:
+        left = int(info["left"])
+        top = int(info["top"])
+        width = int(info["width"])
+        height = int(info["height"])
+    except Exception as exc:
+        raise RuntimeError(f"window has incomplete geometry: {info}") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"window has invalid geometry: {info}")
+    return (left, top, width, height)
+
+
+def resolve_target_region(args: argparse.Namespace) -> tuple[tuple[int, int, int, int] | None, dict[str, Any] | None]:
+    region = parse_region(getattr(args, "region", None))
+    active = bool(getattr(args, "active", False))
+    title = getattr(args, "window", None)
+    target_count = int(region is not None) + int(active) + int(bool(title))
+    if target_count > 1:
+        raise RuntimeError("choose only one target: --region, --active, or --window")
+    if active:
+        win = active_window_object()
+        if not win:
+            raise RuntimeError("no active window")
+        target = {"type": "active-window", **window_info(win)}
+        return window_region(target), target
+    if title:
+        win = find_window(title)
+        target = {"type": "window", "query": title, **window_info(win)}
+        return window_region(target), target
+    if region is not None:
+        return region, {"type": "region", "left": region[0], "top": region[1], "width": region[2], "height": region[3]}
+    return None, None
+
+
+def clamp_window_region_to_primary_screen(
+    pyautogui,
+    region: tuple[int, int, int, int] | None,
+    target: dict[str, Any] | None,
+) -> tuple[tuple[int, int, int, int] | None, dict[str, Any] | None]:
+    if region is None or not target or target.get("type") not in {"active-window", "window"}:
+        return region, target
+    screen = screen_size(pyautogui)
+    left, top, width, height = region
+    right = left + width
+    bottom = top + height
+    clamped_left = max(left, 0)
+    clamped_top = max(top, 0)
+    clamped_right = min(right, screen["width"])
+    clamped_bottom = min(bottom, screen["height"])
+    if clamped_right <= clamped_left or clamped_bottom <= clamped_top:
+        return region, target
+    clamped = (clamped_left, clamped_top, clamped_right - clamped_left, clamped_bottom - clamped_top)
+    if clamped == region:
+        return region, target
+    return clamped, {
+        **target,
+        "requestedRegion": {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        },
+        "clampedToPrimaryScreen": True,
     }
 
 
@@ -363,17 +447,51 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
 def command_screenshot(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
-    region = parse_region(args.region)
+    region, target = resolve_target_region(args)
+    region, target = clamp_window_region_to_primary_screen(pyautogui, region, target)
     check_region_bounds(args, region)
     out = Path(args.out).expanduser()
     confirm_action(args, f"screenshot to {out}")
     if args.dry_run:
-        return ok(action="screenshot", out=str(out), region=region, dryRun=True)
+        return ok(action="screenshot", out=str(out), region=region, target=target, dryRun=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     img = pyautogui.screenshot(region=region)
     img.save(out)
     maybe_sleep(args)
-    return ok(action="screenshot", out=str(out), region=region, size=list(img.size))
+    return ok(action="screenshot", out=str(out), region=region, target=target, size=list(img.size))
+
+
+def command_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    pyautogui = import_pyautogui()
+    pyautogui.FAILSAFE = not args.no_failsafe
+    region, target = resolve_target_region(args)
+    region, target = clamp_window_region_to_primary_screen(pyautogui, region, target)
+    check_region_bounds(args, region)
+    out = Path(args.out).expanduser()
+    confirm_action(args, f"snapshot to {out}")
+    result = ok(
+        action="snapshot",
+        screen=screen_size(pyautogui),
+        mouse=mouse_position(pyautogui),
+        failsafe=pyautogui.FAILSAFE,
+        coordinateSystem="physical_pixels",
+        dpiAware=DPI_AWARE,
+        out=str(out),
+        region=region,
+        target=target,
+    )
+    if args.windows:
+        result["activeWindow"] = active_window()
+        result["windows"] = get_windows()
+    if args.dry_run:
+        result["dryRun"] = True
+        return result
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img = pyautogui.screenshot(region=region)
+    img.save(out)
+    maybe_sleep(args)
+    result["size"] = list(img.size)
+    return result
 
 
 def command_pixel(args: argparse.Namespace) -> dict[str, Any]:
@@ -386,6 +504,7 @@ def command_pixel(args: argparse.Namespace) -> dict[str, Any]:
 def command_move(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
+    require_bool(args.relative, "relative")
     require_non_negative(args.duration, "duration")
     if not args.relative:
         check_point_bounds(args, args.x, args.y)
@@ -404,6 +523,7 @@ def command_click(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_choice(args.button, "button", VALID_MOUSE_BUTTONS)
     require_positive_int(args.clicks, "clicks")
     require_non_negative(args.interval, "interval")
     if args.x is not None and args.y is not None:
@@ -427,6 +547,7 @@ def command_mouse_button(args: argparse.Namespace, is_down: bool) -> dict[str, A
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_choice(args.button, "button", VALID_MOUSE_BUTTONS)
     require_non_negative(args.duration, "duration")
     if args.x is not None and args.y is not None:
         check_point_bounds(args, args.x, args.y)
@@ -448,6 +569,7 @@ def command_hold_mouse(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_choice(args.button, "button", VALID_MOUSE_BUTTONS)
     require_non_negative(args.seconds, "seconds")
     require_non_negative(args.duration, "duration")
     if args.x is not None and args.y is not None:
@@ -469,6 +591,7 @@ def command_hold_mouse(args: argparse.Namespace) -> dict[str, Any]:
 def command_drag(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
+    require_choice(args.button, "button", VALID_MOUSE_BUTTONS)
     require_non_negative(args.duration, "duration")
     require_non_negative(args.move_duration, "move-duration")
     check_point_bounds(args, args.start_x, args.start_y)
@@ -498,6 +621,7 @@ def command_scroll(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui = import_pyautogui()
     pyautogui.FAILSAFE = not args.no_failsafe
     require_pair(args.x, args.y)
+    require_bool(args.horizontal, "horizontal")
     if args.x is not None and args.y is not None:
         check_point_bounds(args, args.x, args.y)
     if args.dry_run:
@@ -527,6 +651,7 @@ def decode_unicode_escapes(text: str) -> str:
 
 
 def read_text_input(args: argparse.Namespace) -> str:
+    require_bool(getattr(args, "decode_unicode_escapes", False), "decode_unicode_escapes")
     sources = [args.text is not None, bool(args.stdin), bool(args.file)]
     if sum(sources) != 1:
         raise RuntimeError("provide exactly one text source: positional text, --stdin, or --file")
@@ -546,6 +671,8 @@ def command_type(args: argparse.Namespace) -> dict[str, Any]:
     pyautogui.FAILSAFE = not args.no_failsafe
     text = read_text_input(args)
     method = args.method
+    require_choice(method, "method", VALID_TYPE_METHODS)
+    require_bool(args.no_restore_clipboard, "no_restore_clipboard")
     if method == "auto":
         method = "paste" if text_needs_paste(text) else "keys"
     if args.wpm:
@@ -641,6 +768,7 @@ def command_key_hold(args: argparse.Namespace) -> dict[str, Any]:
 def command_clipboard(args: argparse.Namespace) -> dict[str, Any]:
     if args.clipboard_command == "set":
         text = args.text
+        require_bool(getattr(args, "decode_unicode_escapes", False), "decode_unicode_escapes")
         if getattr(args, "decode_unicode_escapes", False):
             text = decode_unicode_escapes(text)
         if args.dry_run:
@@ -648,6 +776,8 @@ def command_clipboard(args: argparse.Namespace) -> dict[str, Any]:
         confirm_action(args, f"set clipboard to {len(text)} chars")
         set_clipboard(text)
         return ok(action="clipboard-set", chars=len(text))
+    if args.clipboard_command != "get":
+        raise RuntimeError(f"unknown clipboard command: {args.clipboard_command}")
     text = get_clipboard()
     result = ok(
         action="clipboard-get",
@@ -695,10 +825,11 @@ def command_window(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_find_image(args: argparse.Namespace) -> dict[str, Any]:
     image = str(Path(args.image).expanduser())
-    region = parse_region(args.region)
-    if args.dry_run:
-        return ok(action="find-image", image=image, confidence=args.confidence, region=region, dryRun=True)
     pyautogui = import_pyautogui()
+    region, target = resolve_target_region(args)
+    region, target = clamp_window_region_to_primary_screen(pyautogui, region, target)
+    if args.dry_run:
+        return ok(action="find-image", image=image, confidence=args.confidence, region=region, target=target, dryRun=True)
     check_region_bounds(args, region)
     if is_uniform_image(image):
         location = locate_uniform_image(pyautogui, image, region)
@@ -709,6 +840,7 @@ def command_find_image(args: argparse.Namespace) -> dict[str, Any]:
                 image=image,
                 confidence=args.confidence,
                 region=region,
+                target=target,
                 matchMethod="exact_uniform",
             )
         x, y, width, height = location
@@ -718,6 +850,7 @@ def command_find_image(args: argparse.Namespace) -> dict[str, Any]:
             image=image,
             confidence=args.confidence,
             region=region,
+            target=target,
             matchMethod="exact_uniform",
             box={"x": x, "y": y, "width": width, "height": height},
             center={"x": x + width // 2, "y": y + height // 2},
@@ -727,15 +860,17 @@ def command_find_image(args: argparse.Namespace) -> dict[str, Any]:
     except TypeError:
         location = pyautogui.locateOnScreen(image, region=region)
     except Exception as exc:
-        return fail(str(exc), action="find-image", image=image)
+        return fail(str(exc), action="find-image", image=image, region=region, target=target)
     if not location:
-        return ok(action="find-image", found=False, image=image, confidence=args.confidence, region=region)
+        return ok(action="find-image", found=False, image=image, confidence=args.confidence, region=region, target=target)
     x, y, width, height = map(int, location)
     return ok(
         action="find-image",
         found=True,
         image=image,
         confidence=args.confidence,
+        region=region,
+        target=target,
         box={"x": x, "y": y, "width": width, "height": height},
         center={"x": x + width // 2, "y": y + height // 2},
     )
@@ -777,11 +912,43 @@ def locate_uniform_image(pyautogui, image: str, region: tuple[int, int, int, int
     return (int(offset_x + x), int(offset_y + y), int(needle_width), int(needle_height))
 
 
+PROTECTED_PLAN_ACTION_KEYS = {
+    "dry_run",
+    "func",
+    "lock_owner",
+    "lock_timeout",
+    "lock_token",
+    "lock_ttl",
+    "log_file",
+    "no_failsafe",
+    "pause_after",
+    "plan_file",
+    "plan_json",
+    "require_approval",
+    "stdin",
+    "strict_bounds",
+}
+
+
+def apply_plan_action_fields(ns: argparse.Namespace, action: dict[str, Any]) -> None:
+    blocked = []
+    for key, value in action.items():
+        attr = key.replace("-", "_")
+        if attr in PROTECTED_PLAN_ACTION_KEYS:
+            blocked.append(key)
+            continue
+        setattr(ns, attr, value)
+    if blocked:
+        raise RuntimeError(
+            "plan action cannot override global/control fields: "
+            + ", ".join(sorted(blocked))
+        )
+
+
 def execute_plan_action(action: dict[str, Any], base_args: argparse.Namespace) -> dict[str, Any]:
     cmd = action.get("command")
     ns = argparse.Namespace(**vars(base_args))
-    for key, value in action.items():
-        setattr(ns, key.replace("-", "_"), value)
+    apply_plan_action_fields(ns, action)
 
     defaults = {
         "button": "left",
@@ -799,7 +966,11 @@ def execute_plan_action(action: dict[str, Any], base_args: argparse.Namespace) -
         "decode_unicode_escapes": False,
         "no_restore_clipboard": False,
         "restore_delay": 0.05,
+        "confidence": 0.8,
         "region": None,
+        "active": False,
+        "window": None,
+        "windows": False,
         "x": None,
         "y": None,
     }
@@ -830,6 +1001,8 @@ def execute_plan_action(action: dict[str, Any], base_args: argparse.Namespace) -
         "clipboard-set": lambda a: (setattr(a, "clipboard_command", "set"), command_clipboard(a))[1],
         "window-activate": lambda a: (setattr(a, "window_command", "activate"), command_window(a))[1],
         "screenshot": command_screenshot,
+        "snapshot": command_snapshot,
+        "find-image": command_find_image,
     }
     if cmd == "sleep":
         seconds = float(action.get("seconds", 0))
@@ -952,8 +1125,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("screenshot")
     p.add_argument("--out", required=True)
-    p.add_argument("--region", nargs=4, type=int)
+    screenshot_target = p.add_mutually_exclusive_group()
+    screenshot_target.add_argument("--region", nargs=4, type=int)
+    screenshot_target.add_argument("--active", action="store_true", help="Capture only the active window")
+    screenshot_target.add_argument("--window", help="Capture only the first window whose title contains this text")
     p.set_defaults(func=command_screenshot)
+
+    p = sub.add_parser("snapshot")
+    p.add_argument("--out", required=True)
+    p.add_argument("--windows", action="store_true", help="Include active window and window list metadata")
+    snapshot_target = p.add_mutually_exclusive_group()
+    snapshot_target.add_argument("--region", nargs=4, type=int)
+    snapshot_target.add_argument("--active", action="store_true", help="Capture only the active window")
+    snapshot_target.add_argument("--window", help="Capture only the first window whose title contains this text")
+    p.set_defaults(func=command_snapshot)
 
     p = sub.add_parser("pixel")
     p.add_argument("x", type=int)
@@ -1102,7 +1287,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("find-image")
     p.add_argument("image")
     p.add_argument("--confidence", type=float, default=0.8)
-    p.add_argument("--region", nargs=4, type=int)
+    image_target = p.add_mutually_exclusive_group()
+    image_target.add_argument("--region", nargs=4, type=int)
+    image_target.add_argument("--active", action="store_true", help="Search only within the active window")
+    image_target.add_argument("--window", help="Search only within the first window whose title contains this text")
     p.set_defaults(func=command_find_image)
 
     p = sub.add_parser("plan")

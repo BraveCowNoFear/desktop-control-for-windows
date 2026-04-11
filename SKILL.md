@@ -128,6 +128,8 @@ Use the returned token as `--lock-token <token>` for every command until release
 ```powershell
 python scripts\ui_control.py --lock-token <token> status --windows
 python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\codex-ui.png"
+python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\codex-active.png" --active
+python scripts\ui_control.py --lock-token <token> snapshot --out "$env:TEMP\codex-state.png" --windows --active
 ```
 
 3. Bring the target forward:
@@ -141,12 +143,15 @@ python scripts\ui_control.py --lock-token <token> window activate "Notepad"
 - Text fields: `type --method paste`, using `--decode-unicode-escapes` for Chinese escape text, then `press enter` or `hotkey`.
 - Menus and shortcuts: `hotkey`, `press`, `key-hold`.
 - Buttons and canvases: `click`, `double-click`, `right-click`, `drag`, `scroll`, `hold-mouse`.
+- Known app/window targets: use `snapshot --active`, `screenshot --active`, `screenshot --window "<title>"`, `find-image --active`, or `find-image --window "<title>"` before full-screen capture/search. Use `snapshot --windows` when the worker needs window metadata and a screenshot in the same step. Window targets are clamped to the visible primary screen when Windows reports invisible border offsets.
 - Repeated deterministic sequences: write a JSON action file and run `plan --file`.
 - Unknown visible target: the UI worker must screenshot and inspect, then use coordinates or image matching.
 
 5. Verify with another screenshot or status call.
 
 On PowerShell, prefer `plan --file` over `plan --json` for generated JSON. Complex JSON passed as a native command argument can be re-quoted by PowerShell before Python receives it.
+
+Plan actions may set only action-specific fields. Do not put global/control fields such as `dry-run`, `require-approval`, `no-failsafe`, `strict-bounds`, `pause-after`, `log-file`, `lock-token`, `lock-timeout`, `lock-ttl`, `lock-owner`, `plan-file`, `plan-json`, `func`, or `stdin` inside individual plan actions; the controller rejects them so sub-actions cannot bypass the worker's lock and safety settings. For plan text input, use a `text` value or `file`. Plan-supplied choices and booleans are validated like direct CLI arguments.
 
 6. Release the lock:
 
