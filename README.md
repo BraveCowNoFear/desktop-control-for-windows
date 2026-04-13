@@ -1,29 +1,31 @@
 # Desktop Control for Windows
 
-Desktop Control for Windows is a Codex skill for controlling visible Windows desktop applications through local Python primitives. It can move and click the mouse, type text, paste through the clipboard, take screenshots, inspect pixels, match images, manage windows, and run deterministic multi-step action plans.
+[English](./README.md) | [简体中文](./README.zh-CN.md)
 
-This is intended for cases where no reliable API, DOM, CLI, or app-specific automation surface exists.
+Desktop Control for Windows is a Codex skill for controlling visible Windows desktop applications through local Python primitives. It can move and click the mouse, type text, paste through the clipboard, take screenshots, inspect pixels, match images, manage windows, coordinate a shared UI lock, and run deterministic multi-step action plans.
+
+This project is intended for situations where no reliable API, DOM, CLI, or app-specific automation surface exists.
 
 ## What Is Included
 
-- `SKILL.md` with the coordinator/UI-worker workflow.
-- `scripts/ui_control.py` with local keyboard, mouse, screen, window, clipboard, lock, overlay, and plan commands.
-- `references/control-api.md` with CLI examples.
-- `references/subagent-workflow.md` with worker prompt templates.
-- `agents/openai.yaml` with Codex UI metadata.
+- `SKILL.md` with the coordinator and UI-worker workflow
+- `scripts/ui_control.py` with keyboard, mouse, screen, window, clipboard, lock, overlay, and plan commands
+- `references/control-api.md` with CLI examples
+- `references/subagent-workflow.md` with worker prompt templates
+- `agents/openai.yaml` with Codex UI metadata
 
 ## Safety Model
 
-This skill can read the screen, read or modify the clipboard, type into the active window, click, drag, scroll, and close windows. Use it only in sessions where that level of local control is acceptable.
+This skill can read the screen, inspect or modify the clipboard, type into the active window, click, drag, scroll, and close windows. Use it only in sessions where that level of local control is acceptable.
 
 Recommended defaults:
 
 - Keep PyAutoGUI failsafe enabled.
 - Use the global UI lock for multi-step tasks.
 - Use `--dry-run` for generated plans.
-- Start the warm-color overlay when a UI worker begins, then switch it to the cool completion state when the worker finishes.
+- Start the warm overlay when a UI worker begins, then switch it to the cool completion state when the worker finishes.
 - Use `--require-approval` for risky manual tests.
-- Keep plan JSON limited to action-specific fields; global safety and lock options belong on the command line, not inside individual plan actions.
+- Keep plan JSON limited to action-specific fields. Global safety and lock options belong on the command line, not inside individual plan actions.
 - Avoid secrets, payments, UAC prompts, password managers, banking flows, and destructive actions unless the user explicitly requested the exact action.
 
 The bundled controller is local-only. `scripts/ui_control.py` does not call external network services.
@@ -34,7 +36,7 @@ Clone or copy this repository into your Codex skills directory:
 
 ```powershell
 $skills = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "skills" } else { Join-Path $HOME ".codex\skills" }
-git clone https://github.com/Clr168/desktop-control-for-windows.git (Join-Path $skills "desktop-control-for-windows")
+git clone https://github.com/BraveCowNoFear/desktop-control-for-windows.git (Join-Path $skills "desktop-control-for-windows")
 ```
 
 Install Python dependencies in the Python environment Codex will use:
@@ -56,6 +58,7 @@ python scripts\ui_control.py status --windows
 Run commands from the skill directory:
 
 ```powershell
+python scripts\ui_control.py overlay --mode start --task "example"
 python scripts\ui_control.py lock acquire --owner "example"
 python scripts\ui_control.py --lock-token <token> status --windows
 python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\screen.png"
@@ -69,13 +72,14 @@ python scripts\ui_control.py overlay --mode finish --status success --task "exam
 ```
 
 Global options such as `--lock-token`, `--dry-run`, and `--require-approval` must appear before the subcommand.
-Use `snapshot` when a worker needs both status metadata and a screenshot in one call. Use `--active` or `--window` on screenshots, snapshots, and image search when the target app is known; it avoids full-screen capture/matching and keeps visual loops smaller.
+
+Use `snapshot` when a worker needs both status metadata and a screenshot in one call. Use `--active` or `--window` on screenshots, snapshots, and image search when the target app is known; it avoids full-screen capture and keeps visual loops smaller.
 
 For the Siri-style status frame, call `python scripts\ui_control.py overlay --mode start --task "..."` when the UI worker takes control of the screen. This starts a warm-color click-through border. When the worker is done, call `python scripts\ui_control.py overlay --mode finish --status success|partial|failed ...` to switch the border to a cool completion state with result text. The completion state stays visible until the user clicks anywhere on the screen.
 
 ## Provenance
 
-This project was migrated from the local desktop-control patterns in ClawHub `breckengan/control` v1.0.0. The original ClawHub listing identifies that package as MIT-0 licensed. Upstream demo scripts and rule-based app demos were intentionally not copied; Codex should keep high-level reasoning in the agent loop and use `plan` for deterministic local batching.
+This project was migrated from the local desktop-control patterns in ClawHub `breckengan/control` v1.0.0. The original ClawHub listing identified that package as MIT-0 licensed. Upstream demo scripts and rule-based app demos were intentionally not copied; Codex should keep high-level reasoning in the active agent loop and use `plan` for deterministic local batching.
 
 ## License
 
