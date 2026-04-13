@@ -26,6 +26,7 @@ python scripts\ui_control.py --lock-token <token> <command> ...
 - Use `--log-file` for action history. Results avoid logging typed text by default.
 - Commands automatically use a global UI lock so parallel workers do not fight over the mouse, keyboard, foreground window, or clipboard.
 - For multi-command UI phases, run `lock acquire` first, then pass `--lock-token <token>` to every non-dry-run command, and release the lock at the end.
+- The Siri-style overlay is separate from the UI lock. Start it when the worker begins, then finish it after the lock is released so the completion message can stay visible without blocking other workers.
 - Use `--lock-timeout` to control how long a command waits for another worker's lock. Expired locks are treated as stale and removed automatically.
 - Single commands that acquire their own transient lock include `uiLock.scope: "transient-command"` and `uiLock.released: true` after the command completes. Commands run with a worker-provided token include `uiLock.scope: "provided-token"` and leave release responsibility with the worker.
 
@@ -41,6 +42,20 @@ python scripts\ui_control.py lock release --token <token>
 ```
 
 `lock acquire` returns a token. Keep it inside the UI worker context and pass it as a global option before the subcommand, for example `--lock-token <token> screenshot ...`. Commands without a token acquire a transient per-command lock; that is fine for isolated reads, but a real UI worker should hold one lock across its whole screenshot/act/verify loop.
+
+## Overlay
+
+```powershell
+python scripts\ui_control.py overlay --mode start --task "export report"
+python scripts\ui_control.py overlay --mode finish --status success --task "export report" --completed "Opened the export dialog" --completed "Saved the PDF"
+python scripts\ui_control.py overlay --mode finish --status failed --task "export report" --error "The Save button never appeared" --details "Stopped before any destructive action."
+python scripts\ui_control.py overlay --mode close
+```
+
+- `overlay --mode start` launches a warm-color, click-through border that signals the UI worker currently owns the screen.
+- `overlay --mode finish` switches the same overlay into a cool completion state, shows the task summary and errors, and waits for the user to click anywhere to dismiss it.
+- `overlay --mode close` force-closes the shared overlay state if cleanup is needed.
+- `overlay --mode show` still exists for one-shot manual tests and supports `--auto-close`.
 
 ## Status And Screenshots
 

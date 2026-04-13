@@ -7,7 +7,7 @@ This is intended for cases where no reliable API, DOM, CLI, or app-specific auto
 ## What Is Included
 
 - `SKILL.md` with the coordinator/UI-worker workflow.
-- `scripts/ui_control.py` with local keyboard, mouse, screen, window, clipboard, lock, and plan commands.
+- `scripts/ui_control.py` with local keyboard, mouse, screen, window, clipboard, lock, overlay, and plan commands.
 - `references/control-api.md` with CLI examples.
 - `references/subagent-workflow.md` with worker prompt templates.
 - `agents/openai.yaml` with Codex UI metadata.
@@ -21,6 +21,7 @@ Recommended defaults:
 - Keep PyAutoGUI failsafe enabled.
 - Use the global UI lock for multi-step tasks.
 - Use `--dry-run` for generated plans.
+- Start the warm-color overlay when a UI worker begins, then switch it to the cool completion state when the worker finishes.
 - Use `--require-approval` for risky manual tests.
 - Keep plan JSON limited to action-specific fields; global safety and lock options belong on the command line, not inside individual plan actions.
 - Avoid secrets, payments, UAC prompts, password managers, banking flows, and destructive actions unless the user explicitly requested the exact action.
@@ -64,10 +65,13 @@ python scripts\ui_control.py --lock-token <token> find-image C:\path\button.png 
 python scripts\ui_control.py --lock-token <token> hotkey ctrl l
 python scripts\ui_control.py --lock-token <token> type "hello world" --method paste
 python scripts\ui_control.py lock release --token <token>
+python scripts\ui_control.py overlay --mode finish --status success --task "example" --completed "Finished the requested UI task"
 ```
 
 Global options such as `--lock-token`, `--dry-run`, and `--require-approval` must appear before the subcommand.
 Use `snapshot` when a worker needs both status metadata and a screenshot in one call. Use `--active` or `--window` on screenshots, snapshots, and image search when the target app is known; it avoids full-screen capture/matching and keeps visual loops smaller.
+
+For the Siri-style status frame, call `python scripts\ui_control.py overlay --mode start --task "..."` when the UI worker takes control of the screen. This starts a warm-color click-through border. When the worker is done, call `python scripts\ui_control.py overlay --mode finish --status success|partial|failed ...` to switch the border to a cool completion state with result text. The completion state stays visible until the user clicks anywhere on the screen.
 
 ## Provenance
 

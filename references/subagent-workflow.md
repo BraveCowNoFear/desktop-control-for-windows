@@ -14,7 +14,7 @@ Locale-sensitive search: before searching for a named UI target, the UI worker m
 - Spawn exactly one dedicated UI worker for each live UI task or coherent UI phase. This is allowed even when the coordinator is itself a task subagent.
 - Give the UI worker a narrow, concrete outcome and the current safety boundary.
 - Tell the UI worker explicitly that it is the UI worker and must not spawn or delegate to another agent.
-- Tell the UI worker explicitly to acquire the global UI lock before touching the desktop, pass `--lock-token` to every command, and release the lock before returning.
+- Tell the UI worker explicitly to start the warm overlay before touching the desktop, acquire the global UI lock, pass `--lock-token` to every command, release the lock, switch the overlay to the cool completion state, and only then return.
 - Tell the UI worker explicitly to inspect the visible UI language before choosing a search term; use `--decode-unicode-escapes` for Chinese UI and English/ASCII aliases only for English UI.
 - Do not personally call screenshot/image-viewing/UI-control commands for the live UI task.
 - If delegation is unavailable or disallowed by missing tools or runtime policy, stop and report the blocker instead of doing the UI work in the main context. Do not ask the user for a passphrase or extra UI-worker authorization.
@@ -26,14 +26,14 @@ Locale-sensitive search: before searching for a named UI target, the UI worker m
 - Use this skill's `scripts\ui_control.py` for all local control.
 - Do not call `spawn_agent`, `send_input`, `wait_agent`, `close_agent`, OpenSpace delegation tools, or any equivalent nested-agent mechanism.
 - Do not re-apply the coordinator delegation rule to yourself. You are already the delegated UI worker.
-- Acquire the global UI lock before touching the desktop, keep the token private, pass `--lock-token` to every non-dry-run UI command, and release it before returning.
+- Start the warm overlay before touching the desktop, then acquire the global UI lock, keep the token private, pass `--lock-token` to every non-dry-run UI command, release it before finishing, and switch the overlay to the cool completion state.
 - Inspect the app language before searching for contacts, buttons, menus, or labels. If the UI is Chinese, pass Unicode escapes to `--decode-unicode-escapes`; if the UI is English, use English text or ASCII aliases.
 - Keep screenshots in a temp directory such as `$env:TEMP\codex-ui-subagent\`.
 - Inspect screenshots locally in the subagent context and do not paste screenshots into the final response unless explicitly requested.
 - Prefer hotkeys and clipboard paste over coordinate clicks when reliable.
 - Use `--dry-run` before long `plan` sequences.
 - Verify final state with a screenshot or non-image status command.
-- Return a concise text report, not raw image content.
+- Return a concise text report, not raw image content, and mention whether the overlay reached the cool completion state.
 
 ## Standard Spawn Prompt
 
@@ -52,7 +52,7 @@ Target app/window:
 
 Safety boundary:
 - Use only local scripts\ui_control.py.
-- Acquire the global UI lock first, pass --lock-token to every UI command, and release the lock before returning.
+- Start the warm overlay first with `python scripts\ui_control.py overlay --mode start --task "<task label>"`. Then acquire the global UI lock, pass --lock-token to every UI command, release the lock, switch the overlay to the cool completion state with `overlay --mode finish`, and only then return.
 - Before searching for File Transfer Assistant, inspect whether WeChat is in Chinese or English. Chinese UI: paste `\u6587\u4ef6\u4f20\u8f93\u52a9\u624b` through `type ... --decode-unicode-escapes --method paste`. English UI: use File Transfer Assistant or `filehelper`.
 - Do not create nested agents or subagents.
 - Do not use remote visual models, browser extensions, or external services.
@@ -61,13 +61,15 @@ Safety boundary:
 - Use --require-approval for risky actions if you must perform them.
 
 Workflow:
-1. Acquire the global UI lock with `lock acquire --owner "<task label>"`.
-2. Run status/window checks and take screenshots only inside your subagent context, passing `--lock-token <token>`.
-3. Inspect screenshots yourself, determine the UI language, and choose localized search/input text accordingly.
-4. Prefer hotkeys/clipboard paste over mouse clicks when reliable.
-5. Use --dry-run for any multi-step plan before executing.
-6. Execute the task with `--lock-token <token>`, then verify the final UI state.
-7. Release the lock before returning.
+1. Start the warm overlay with `python scripts\ui_control.py overlay --mode start --task "<task label>"`.
+2. Acquire the global UI lock with `lock acquire --owner "<task label>"`.
+3. Run status/window checks and take screenshots only inside your subagent context, passing `--lock-token <token>`.
+4. Inspect screenshots yourself, determine the UI language, and choose localized search/input text accordingly.
+5. Prefer hotkeys/clipboard paste over mouse clicks when reliable.
+6. Use --dry-run for any multi-step plan before executing.
+7. Execute the task with `--lock-token <token>`, then verify the final UI state.
+8. Release the lock.
+9. Switch the overlay to the cool completion state with `python scripts\ui_control.py overlay --mode finish ...`.
 
 Return only:
 - Outcome: success/partial/failed
@@ -76,6 +78,7 @@ Return only:
 - Screenshot file paths you created
 - Any coordinates or window titles that matter
 - Whether the UI lock was acquired and released
+- Whether the overlay switched from warm in-progress to cool completion state
 - Any uncertainty or next recommended action for the coordinator
 ```
 
@@ -94,7 +97,7 @@ Current foreground window.
 
 Safety boundary:
 - Use only local scripts\ui_control.py.
-- Acquire the global UI lock first, pass --lock-token to every UI command, and release the lock before returning.
+- Start the warm overlay first with `python scripts\ui_control.py overlay --mode start --task "<task label>"`. Then acquire the global UI lock, pass --lock-token to every UI command, release the lock, switch the overlay to the cool completion state with `overlay --mode finish`, and only then return.
 - Before searching for a localized UI target, inspect the app language. Use `--decode-unicode-escapes` with Unicode-escaped Chinese for Chinese UI and English/ASCII aliases only for English UI.
 - Do not create nested agents or subagents.
 - Do not use remote visual models, browser extensions, or external services.
@@ -102,13 +105,15 @@ Safety boundary:
 - Keep PyAutoGUI failsafe enabled.
 
 Workflow:
-1. Acquire the global UI lock with `lock acquire --owner "<task label>"`.
-2. Run status/window checks and take screenshots only inside your subagent context, passing `--lock-token <token>`.
-3. Inspect screenshots yourself, determine the UI language, and decide coordinates/actions and text accordingly.
-4. Prefer hotkeys/clipboard paste over mouse clicks when reliable.
-5. Use --dry-run for any multi-step plan before executing.
-6. Execute the task with `--lock-token <token>`, then verify the final UI state.
-7. Release the lock before returning.
+1. Start the warm overlay with `python scripts\ui_control.py overlay --mode start --task "<task label>"`.
+2. Acquire the global UI lock with `lock acquire --owner "<task label>"`.
+3. Run status/window checks and take screenshots only inside your subagent context, passing `--lock-token <token>`.
+4. Inspect screenshots yourself, determine the UI language, and decide coordinates/actions and text accordingly.
+5. Prefer hotkeys/clipboard paste over mouse clicks when reliable.
+6. Use --dry-run for any multi-step plan before executing.
+7. Execute the task with `--lock-token <token>`, then verify the final UI state.
+8. Release the lock.
+9. Switch the overlay to the cool completion state with `python scripts\ui_control.py overlay --mode finish ...`.
 
 Return only:
 - Outcome
@@ -117,6 +122,7 @@ Return only:
 - Screenshot file paths
 - Coordinates/window titles used
 - Whether the UI lock was acquired and released
+- Whether the overlay switched from warm in-progress to cool completion state
 - Remaining uncertainty
 ```
 
@@ -125,5 +131,5 @@ Return only:
 Use this when the first worker returns uncertainty:
 
 ```text
-Continue the Windows UI task using $desktop-control-for-windows. You are still the UI worker, not the coordinator. Do not spawn, delegate to, message, or wait on another agent. Acquire the global UI lock first, pass --lock-token to every UI command, inspect the app language before choosing search/input text, use Unicode-escaped Chinese only when the UI is Chinese and English/ASCII aliases only when the UI is English, release the lock before returning, and return the same concise report format. Use the previous worker's reported screenshot paths and coordinates only as hints, not ground truth. Take a fresh screenshot in your own context, verify the current state, then perform the smallest safe next action.
+Continue the Windows UI task using $desktop-control-for-windows. You are still the UI worker, not the coordinator. Do not spawn, delegate to, message, or wait on another agent. Start the warm overlay first, acquire the global UI lock, pass --lock-token to every UI command, inspect the app language before choosing search/input text, use Unicode-escaped Chinese only when the UI is Chinese and English/ASCII aliases only when the UI is English, release the lock, switch the overlay to the cool completion state before returning, and return the same concise report format. Use the previous worker's reported screenshot paths and coordinates only as hints, not ground truth. Take a fresh screenshot in your own context, verify the current state, then perform the smallest safe next action.
 ```

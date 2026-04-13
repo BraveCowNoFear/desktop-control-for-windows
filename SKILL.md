@@ -26,7 +26,7 @@ Source migrated from ClawHub `breckengan/control` v1.0.0 for local desktop contr
 
 ## Migration Scope
 
-Migrated local Control capabilities: absolute/relative mouse movement, smooth-duration movement through PyAutoGUI, left/right/middle/double click, mouse down/up, long mouse hold, drag, vertical/horizontal scroll, mouse position, text entry by keystrokes or clipboard paste, hotkeys, key down/up, key hold, screenshots, region screenshots, pixel color, image matching, screen size, window list/active/activate/info/minimize/maximize/restore/close, clipboard set/get, failsafe, optional approval, strict bounds checks, JSONL action logging, and batch plans.
+Migrated local Control capabilities: absolute/relative mouse movement, smooth-duration movement through PyAutoGUI, left/right/middle/double click, mouse down/up, long mouse hold, drag, vertical/horizontal scroll, mouse position, text entry by keystrokes or clipboard paste, hotkeys, key down/up, key hold, screenshots, region screenshots, pixel color, image matching, screen size, window list/active/activate/info/minimize/maximize/restore/close, clipboard set/get, full-screen completion overlays, failsafe, optional approval, strict bounds checks, JSONL action logging, and batch plans.
 
 Intentionally not copied: the upstream demo scripts and rule-based `ai_agent.py` app demos. In Codex, high-level reasoning should remain in the active agent loop, with `plan` for deterministic batching.
 
@@ -43,10 +43,10 @@ Read `references/subagent-workflow.md` before delegating UI work. The coordinato
 - Clarify the goal internally and define a narrow UI task for the subagent.
 - Include the exact target app/window, desired outcome, safety limits, and whether irreversible actions are allowed.
 - State explicitly in the worker prompt: "You are the UI worker. Do not spawn or delegate to another agent."
-- Tell the subagent to acquire the global UI lock before touching the UI, pass `--lock-token` to every `scripts/ui_control.py` command, and release the lock before returning.
+- Tell the subagent to start the warm-color overlay as soon as it begins controlling the screen, acquire the global UI lock before touching the UI, pass `--lock-token` to every `scripts/ui_control.py` command, release the lock before switching the overlay to the cool completion state, and only then return.
 - Tell the subagent to use only local `scripts/ui_control.py`; do not use remote visual models, browser extensions, or external services.
 - Tell the subagent to inspect the UI language before choosing search/input text; Chinese UI needs `--decode-unicode-escapes`, English UI may use English/ASCII aliases.
-- Ask the subagent to return a concise text report with commands used, final state, screenshot file paths, and any unresolved uncertainty.
+- Ask the subagent to show a warm in-progress overlay at the start and switch it to a cool completion overlay with the task, completed work, and any errors before returning a concise text report with commands used, final state, screenshot file paths, and unresolved uncertainty.
 - Avoid requesting raw screenshots in the subagent final answer unless the user specifically needs them.
 
 ## UI Worker Protocol
@@ -60,20 +60,23 @@ Hard rules:
 - Use only this skill's `scripts/ui_control.py` and ordinary local shell commands needed to inspect outputs.
 - Keep screenshots in a temp folder such as `$env:TEMP\codex-ui-subagent\`.
 - Inspect screenshots inside your own context and return only text plus screenshot paths.
+- Start a warm-color full-screen overlay before touching the screen. Before the final text response, release the UI lock and switch that overlay into a cool completion state with the task result. The completion state must stay on screen until the user clicks to dismiss it, unless the prompt explicitly says otherwise.
 - If you cannot complete the UI task locally, report `partial` or `failed` with the blocker. Do not escalate by spawning another agent.
 
 Worker loop:
 
-1. Acquire the global UI lock with `lock acquire --owner "<task label>"` and keep the returned token private in your worker context.
-2. Pass `--lock-token <token>` to every non-dry-run `scripts/ui_control.py` command until release.
-3. Run `status --windows` and take a fresh screenshot while holding the lock.
-4. Inspect screenshots locally and choose the smallest safe action.
-5. Prefer hotkeys and clipboard paste over mouse coordinates when reliable.
-6. Use `--dry-run` before long or risky plans.
-7. Execute with `scripts/ui_control.py`.
-8. Verify with another screenshot or non-image status command.
-9. Release the lock with `lock release --token <token>` in cleanup.
-10. Return outcome, summarized actions, final observed state, screenshot paths, and unresolved uncertainty.
+1. Start the warm-color overlay with `overlay --mode start --task "<task label>"` before touching the live desktop.
+2. Acquire the global UI lock with `lock acquire --owner "<task label>"` and keep the returned token private in your worker context.
+3. Pass `--lock-token <token>` to every non-dry-run `scripts/ui_control.py` command until release.
+4. Run `status --windows` and take a fresh screenshot while holding the lock.
+5. Inspect screenshots locally and choose the smallest safe action.
+6. Prefer hotkeys and clipboard paste over mouse coordinates when reliable.
+7. Use `--dry-run` before long or risky plans.
+8. Execute with `scripts/ui_control.py`.
+9. Verify with another screenshot or non-image status command.
+10. Release the lock with `lock release --token <token>` in cleanup.
+11. Switch the overlay into the cool completion state with `overlay --mode finish` and include the task summary, completed actions, and any errors or blockers.
+12. Return outcome, summarized actions, final observed state, screenshot paths, and unresolved uncertainty.
 
 ## Decision Rules
 
@@ -92,6 +95,7 @@ This section is for UI workers and skill debugging only. A coordinator must not 
 Run from the skill directory:
 
 ```powershell
+python scripts\ui_control.py overlay --mode start --task "wechat-file-transfer"
 python scripts\ui_control.py lock acquire --owner "wechat-file-transfer"
 python scripts\ui_control.py --lock-token <token> status --windows
 python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\screen.png"
@@ -103,6 +107,7 @@ python scripts\ui_control.py --lock-token <token> drag 100 100 700 450 --duratio
 python scripts\ui_control.py --lock-token <token> scroll -6 --x 900 --y 500
 python scripts\ui_control.py --lock-token <token> hold-mouse --x 500 --y 300 --seconds 1.2
 python scripts\ui_control.py lock release --token <token>
+python scripts\ui_control.py overlay --mode finish --status success --title "UI Worker Finished" --task "wechat-file-transfer" --completed "Opened File Transfer Assistant" --completed "Pasted the requested text"
 ```
 
 All commands print JSON. Check `ok`, `error`, output paths, active window, and coordinates before continuing.
@@ -115,7 +120,13 @@ For complete CLI syntax, read `references/control-api.md`.
 
 ## Workflow
 
-1. Acquire the global UI lock:
+1. Start the warm-color overlay:
+
+```powershell
+python scripts\ui_control.py overlay --mode start --task "short task label"
+```
+
+2. Acquire the global UI lock:
 
 ```powershell
 python scripts\ui_control.py lock acquire --owner "short task label"
@@ -123,7 +134,7 @@ python scripts\ui_control.py lock acquire --owner "short task label"
 
 Use the returned token as `--lock-token <token>` for every command until release.
 
-2. Inspect state:
+3. Inspect state:
 
 ```powershell
 python scripts\ui_control.py --lock-token <token> status --windows
@@ -132,13 +143,13 @@ python scripts\ui_control.py --lock-token <token> screenshot --out "$env:TEMP\co
 python scripts\ui_control.py --lock-token <token> snapshot --out "$env:TEMP\codex-state.png" --windows --active
 ```
 
-3. Bring the target forward:
+4. Bring the target forward:
 
 ```powershell
 python scripts\ui_control.py --lock-token <token> window activate "Notepad"
 ```
 
-4. Use the fastest reliable primitive:
+5. Use the fastest reliable primitive:
 
 - Text fields: `type --method paste`, using `--decode-unicode-escapes` for Chinese escape text, then `press enter` or `hotkey`.
 - Menus and shortcuts: `hotkey`, `press`, `key-hold`.
@@ -147,17 +158,25 @@ python scripts\ui_control.py --lock-token <token> window activate "Notepad"
 - Repeated deterministic sequences: write a JSON action file and run `plan --file`.
 - Unknown visible target: the UI worker must screenshot and inspect, then use coordinates or image matching.
 
-5. Verify with another screenshot or status call.
+6. Verify with another screenshot or status call.
 
 On PowerShell, prefer `plan --file` over `plan --json` for generated JSON. Complex JSON passed as a native command argument can be re-quoted by PowerShell before Python receives it.
 
 Plan actions may set only action-specific fields. Do not put global/control fields such as `dry-run`, `require-approval`, `no-failsafe`, `strict-bounds`, `pause-after`, `log-file`, `lock-token`, `lock-timeout`, `lock-ttl`, `lock-owner`, `plan-file`, `plan-json`, `func`, or `stdin` inside individual plan actions; the controller rejects them so sub-actions cannot bypass the worker's lock and safety settings. For plan text input, use a `text` value or `file`. Plan-supplied choices and booleans are validated like direct CLI arguments.
 
-6. Release the lock:
+7. Release the lock:
 
 ```powershell
 python scripts\ui_control.py lock release --token <token>
 ```
+
+8. Switch the overlay into the cool completion state after the lock is released:
+
+```powershell
+python scripts\ui_control.py overlay --mode finish --status success --title "UI Worker Finished" --task "short task label" --completed "Activated the target window" --completed "Finished the requested UI action" --details "Click anywhere to dismiss."
+```
+
+Use `--status partial` or `--status failed` and repeat `--error "<message>"` when the worker hit blockers. `overlay --mode start` is warm and click-through so work can continue. `overlay --mode finish` is cool and intentionally outside the UI lock so the screen-control lock is not held while waiting for the user to click.
 
 ## Safety
 
