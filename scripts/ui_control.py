@@ -51,6 +51,13 @@ LOCK_POLL_SECONDS = 0.2
 LOCK_FILE = Path(
     os.environ.get("CODEX_UI_CONTROL_LOCK_FILE", str(Path(tempfile.gettempdir()) / "codex-ui-control.lock.json"))
 )
+LOCK_METADATA_GUARD_FILE = Path(str(LOCK_FILE) + ".guard")
+LOCK_METADATA_GUARD_TTL_SECONDS = 15.0
+OVERLAY_STATE_POINTER_FILE = Path(str(LOCK_FILE) + ".overlay-state.json")
+DEFAULT_OVERLAY_IDLE_SECONDS = max(
+    float(os.environ.get("CODEX_UI_OVERLAY_IDLE_SECONDS", "90") or 90.0),
+    15.0,
+)
 VALID_MOUSE_BUTTONS = {"left", "right", "middle"}
 VALID_TYPE_METHODS = {"auto", "keys", "paste"}
 
@@ -82,32 +89,177 @@ def emit(result: dict[str, Any]) -> int:
     return 0 if result.get("ok") else 1
 
 
+def current_codex_thread_id() -> str:
+    return str(os.environ.get("CODEX_THREAD_ID") or "").strip()
+
+
+def write_text_atomic(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(path.parent)) as handle:
+        handle.write(data)
+        temp_name = handle.name
+    try:
+        last_error: Exception | None = None
+        for _ in range(8):
+            try:
+                os.replace(temp_name, path)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.02)
+        if last_error is not None:
+            raise last_error
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any], *, indent: int | None = None) -> None:
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=indent))
+
+
+def lock_token_hash(token: str | None) -> str:
+    token_text = str(token or "")
+    if not token_text:
+        return ""
+    return hashlib.sha256(token_text.encode("utf-8")).hexdigest()[:12]
+
+
+def remove_file_with_retries(path: Path, *, attempts: int = 8, delay: float = 0.02) -> None:
+    last_error: Exception | None = None
+    for _ in range(max(attempts, 1)):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+
+
 def lock_record_public(record: dict[str, Any]) -> dict[str, Any]:
     token = str(record.get("token") or "")
     public = {key: value for key, value in record.items() if key != "token" and not key.startswith("_")}
     if token:
-        public["tokenHash"] = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+        public["tokenHash"] = lock_token_hash(token)
     public["lockFile"] = str(LOCK_FILE)
-    public["expired"] = float(record.get("expiresAt", 0) or 0) <= time.time()
+    public["expired"] = lock_expired(record)
     return public
 
 
-def read_ui_lock() -> dict[str, Any] | None:
+@contextmanager
+def ui_lock_metadata_guard(timeout: float = 5.0) -> Iterator[None]:
+    deadline = time.time() + max(timeout, 0.0)
+    payload = {
+        "pid": os.getpid(),
+        "threadId": current_codex_thread_id(),
+        "createdAt": time.time(),
+        "expiresAt": time.time() + LOCK_METADATA_GUARD_TTL_SECONDS,
+    }
+    while True:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        try:
+            fd = os.open(str(LOCK_METADATA_GUARD_FILE), flags)
+        except FileExistsError:
+            stale = False
+            try:
+                guard = json.loads(LOCK_METADATA_GUARD_FILE.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                time.sleep(0.02)
+                continue
+            except Exception:
+                stale = True
+            else:
+                stale = float(guard.get("expiresAt", 0) or 0) <= time.time()
+            if stale:
+                try:
+                    remove_file_with_retries(LOCK_METADATA_GUARD_FILE)
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    time.sleep(0.02)
+                continue
+            if time.time() >= deadline:
+                raise RuntimeError(f"UI control metadata lock busy: {LOCK_METADATA_GUARD_FILE}")
+            time.sleep(0.02)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        break
     try:
-        return json.loads(LOCK_FILE.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return {"corrupt": True, "expiresAt": 0, "owner": "unknown"}
+        yield
+    finally:
+        try:
+            remove_file_with_retries(LOCK_METADATA_GUARD_FILE)
+        except FileNotFoundError:
+            pass
+
+
+def read_ui_lock_unlocked() -> dict[str, Any] | None:
+    for attempt in range(3):
+        try:
+            return json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError:
+            if attempt >= 2:
+                return {"corrupt": True, "expiresAt": 0, "owner": "unknown"}
+            time.sleep(0.02)
+        except Exception:
+            return {"corrupt": True, "expiresAt": 0, "owner": "unknown"}
+    return {"corrupt": True, "expiresAt": 0, "owner": "unknown"}
+
+
+def read_ui_lock() -> dict[str, Any] | None:
+    with ui_lock_metadata_guard():
+        return read_ui_lock_unlocked()
+
+
+def overlay_state_matches_lock_thread(payload: dict[str, Any], record: dict[str, Any]) -> bool:
+    lock_thread_id = str(record.get("threadId") or "").strip()
+    if not lock_thread_id:
+        return True
+    state_thread_id = str(payload.get("threadId") or "").strip()
+    if not state_thread_id:
+        return False
+    return state_thread_id == lock_thread_id
+
+
+def overlay_state_holds_lock(record: dict[str, Any] | None) -> bool:
+    if not record or not record.get("overlaySessionExpected"):
+        return False
+    state_path_raw = str(record.get("overlayStateFile") or "").strip()
+    state_path = Path(state_path_raw).expanduser() if state_path_raw else resolve_overlay_state_file()
+    state = read_overlay_state(state_path)
+    if not state:
+        return False
+    if not overlay_state_matches_lock_thread(state, record):
+        return False
+    if overlay_is_stale(state, lock_record=record):
+        return False
+    return True
 
 
 def lock_expired(record: dict[str, Any] | None) -> bool:
     if not record:
         return True
-    return float(record.get("expiresAt", 0) or 0) <= time.time()
+    if float(record.get("expiresAt", 0) or 0) <= time.time():
+        return True
+    if record.get("overlaySessionExpected"):
+        return not overlay_state_holds_lock(record)
+    return False
 
 
-def remove_stale_lock(record: dict[str, Any] | None) -> None:
+def remove_stale_lock_unlocked(record: dict[str, Any] | None) -> None:
     if not lock_expired(record):
         return
     try:
@@ -116,14 +268,17 @@ def remove_stale_lock(record: dict[str, Any] | None) -> None:
         pass
 
 
-def create_ui_lock(token: str, owner: str, ttl: float) -> dict[str, Any] | None:
+def create_ui_lock_unlocked(token: str, owner: str, ttl: float) -> dict[str, Any] | None:
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
     record = {
         "token": token,
         "owner": owner,
         "pid": os.getpid(),
-        "createdAt": time.time(),
-        "expiresAt": time.time() + ttl,
+        "threadId": current_codex_thread_id(),
+        "createdAt": now,
+        "updatedAt": now,
+        "expiresAt": now + ttl,
     }
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
@@ -139,40 +294,58 @@ def acquire_ui_lock(timeout: float, ttl: float, owner: str) -> dict[str, Any]:
     token = uuid.uuid4().hex
     deadline = time.time() + max(timeout, 0)
     while True:
-        record = read_ui_lock()
-        if record is None or lock_expired(record):
-            remove_stale_lock(record)
-            created = create_ui_lock(token, owner, ttl)
-            if created:
-                return created
-        if time.time() >= deadline:
-            current = read_ui_lock()
-            raise RuntimeError(f"UI control lock busy: {lock_record_public(current or {})}")
+        with ui_lock_metadata_guard(timeout=max(timeout, 5.0)):
+            record = read_ui_lock_unlocked()
+            if record is None or lock_expired(record):
+                remove_stale_lock_unlocked(record)
+                created = create_ui_lock_unlocked(token, owner, ttl)
+                if created:
+                    return created
+            if time.time() >= deadline:
+                current = read_ui_lock_unlocked()
+                raise RuntimeError(f"UI control lock busy: {lock_record_public(current or {})}")
         time.sleep(LOCK_POLL_SECONDS)
 
 
 def validate_ui_lock_token(token: str, ttl: float) -> dict[str, Any]:
-    record = read_ui_lock()
-    if not record:
-        raise RuntimeError("UI control lock token provided, but no active lock exists")
-    if lock_expired(record):
-        remove_stale_lock(record)
-        raise RuntimeError("UI control lock token expired")
-    if record.get("token") != token:
-        raise RuntimeError(f"UI control lock is held by another worker: {lock_record_public(record)}")
-    record["expiresAt"] = time.time() + ttl
-    LOCK_FILE.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    return record
+    with ui_lock_metadata_guard():
+        record = read_ui_lock_unlocked()
+        if not record:
+            raise RuntimeError("UI control lock token provided, but no active lock exists")
+        if lock_expired(record):
+            remove_stale_lock_unlocked(record)
+            raise RuntimeError("UI control lock token expired")
+        if record.get("token") != token:
+            raise RuntimeError(f"UI control lock is held by another worker: {lock_record_public(record)}")
+        now = time.time()
+        record["expiresAt"] = now + ttl
+        record["updatedAt"] = now
+        thread_id = current_codex_thread_id()
+        if thread_id:
+            record["threadId"] = thread_id
+        write_json_atomic(LOCK_FILE, record)
+        return record
 
 
 def release_ui_lock(token: str) -> dict[str, Any]:
-    record = read_ui_lock()
-    if not record:
-        return ok(action="lock-release", released=False, reason="no active lock", lockFile=str(LOCK_FILE))
-    if record.get("token") != token:
-        raise RuntimeError(f"cannot release UI control lock held by another worker: {lock_record_public(record)}")
-    LOCK_FILE.unlink()
-    return ok(action="lock-release", released=True, lockFile=str(LOCK_FILE))
+    with ui_lock_metadata_guard():
+        record = read_ui_lock_unlocked()
+        if not record:
+            return ok(action="lock-release", released=False, reason="no active lock", lockFile=str(LOCK_FILE))
+        if record.get("token") != token:
+            raise RuntimeError(f"cannot release UI control lock held by another worker: {lock_record_public(record)}")
+        LOCK_FILE.unlink()
+        return ok(action="lock-release", released=True, lockFile=str(LOCK_FILE))
+
+
+def link_lock_to_overlay(lock_token: str, state_file: Path) -> None:
+    with ui_lock_metadata_guard():
+        record = read_ui_lock_unlocked()
+        if not record or record.get("token") != lock_token:
+            return
+        record["overlaySessionExpected"] = True
+        record["overlayStateFile"] = str(state_file)
+        write_json_atomic(LOCK_FILE, record)
 
 
 def refresh_ui_lock(token: str, ttl: float) -> dict[str, Any]:
@@ -188,12 +361,15 @@ def ui_lock_for_command(args: argparse.Namespace) -> Iterator[dict[str, Any] | N
     ttl = max(float(getattr(args, "lock_ttl", DEFAULT_LOCK_TTL_SECONDS) or DEFAULT_LOCK_TTL_SECONDS), 1.0)
     token = getattr(args, "lock_token", None)
     if token:
-        yield validate_ui_lock_token(token, ttl)
+        record = validate_ui_lock_token(token, ttl)
+        touch_overlay_activity(lock_token=token)
+        yield record
         return
     timeout = max(float(getattr(args, "lock_timeout", DEFAULT_LOCK_TIMEOUT_SECONDS) or 0), 0.0)
     owner = getattr(args, "lock_owner", None) or f"pid:{os.getpid()} command:{getattr(args, 'command', 'unknown')}"
     record = acquire_ui_lock(timeout, ttl, owner)
     record["_transient"] = True
+    touch_overlay_activity(lock_token=str(record.get("token") or ""))
     try:
         yield record
     finally:
@@ -655,6 +831,22 @@ def default_overlay_state_file() -> Path:
     return Path(tempfile.gettempdir()) / "codex-ui-worker-overlay.json"
 
 
+def resolve_overlay_state_file(path: Path | None = None) -> Path:
+    if path is not None:
+        return path
+    env_path = str(os.environ.get("CODEX_UI_OVERLAY_STATE_FILE") or "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    pointer = read_overlay_state_pointer()
+    if pointer:
+        pointer_path = str(pointer.get("stateFile") or "").strip()
+        pointer_thread_id = str(pointer.get("threadId") or "").strip()
+        current_thread_id = current_codex_thread_id()
+        if pointer_path and (not current_thread_id or pointer_thread_id == current_thread_id):
+            return Path(pointer_path).expanduser()
+    return default_overlay_state_file()
+
+
 def read_overlay_state(path: Path) -> dict[str, Any] | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -665,8 +857,7 @@ def read_overlay_state(path: Path) -> dict[str, Any] | None:
 
 
 def write_overlay_state(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(path, payload, indent=2)
 
 
 def remove_overlay_state(path: Path) -> None:
@@ -674,6 +865,102 @@ def remove_overlay_state(path: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+    remove_overlay_state_pointer(path)
+
+
+def read_overlay_state_pointer() -> dict[str, Any] | None:
+    try:
+        return json.loads(OVERLAY_STATE_POINTER_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
+def write_overlay_state_pointer(path: Path) -> None:
+    payload = {
+        "stateFile": str(path),
+        "threadId": current_codex_thread_id(),
+        "updatedAt": time.time(),
+    }
+    write_json_atomic(OVERLAY_STATE_POINTER_FILE, payload, indent=2)
+
+
+def remove_overlay_state_pointer(path: Path | None = None) -> None:
+    pointer = read_overlay_state_pointer()
+    if not pointer:
+        return
+    if path is not None and str(pointer.get("stateFile") or "").strip() != str(path):
+        return
+    try:
+        remove_file_with_retries(OVERLAY_STATE_POINTER_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def overlay_state_matches_current_thread(payload: dict[str, Any]) -> bool:
+    state_thread_id = str(payload.get("threadId") or "").strip()
+    current_thread_id = current_codex_thread_id()
+    if not current_thread_id:
+        return True
+    if not state_thread_id:
+        return False
+    return state_thread_id == current_thread_id
+
+
+def overlay_is_stale(payload: dict[str, Any], *, lock_record: dict[str, Any] | None = None) -> bool:
+    if str(payload.get("phase") or "").lower() != "working":
+        return False
+    last_activity = float(
+        payload.get("activityAt")
+        or payload.get("updatedAt")
+        or payload.get("startedAt")
+        or 0.0
+    )
+    if last_activity <= 0:
+        return False
+    idle_seconds = time.time() - last_activity
+    if idle_seconds <= DEFAULT_OVERLAY_IDLE_SECONDS:
+        return False
+    state_token_hash = str(payload.get("lockTokenHash") or "").strip()
+    if not state_token_hash:
+        return True
+    if lock_record is None:
+        lock_record = read_ui_lock()
+    if not lock_record:
+        return True
+    if lock_token_hash(lock_record.get("token")) != state_token_hash:
+        return True
+    if float(lock_record.get("expiresAt", 0) or 0) <= time.time():
+        return True
+    return idle_seconds > (DEFAULT_OVERLAY_IDLE_SECONDS * 2.0)
+
+
+def touch_overlay_activity(
+    *,
+    state_file: Path | None = None,
+    lock_token: str | None = None,
+    force: bool = False,
+) -> None:
+    path = resolve_overlay_state_file(state_file)
+    state = read_overlay_state(path)
+    if not state:
+        return
+    if not force and str(state.get("phase") or "").lower() != "working":
+        return
+    if not force and not overlay_state_matches_current_thread(state):
+        return
+    now = time.time()
+    state["updatedAt"] = now
+    state["activityAt"] = now
+    thread_id = current_codex_thread_id()
+    if thread_id:
+        state["threadId"] = thread_id
+    if lock_token:
+        state["lockTokenHash"] = lock_token_hash(lock_token)
+    write_overlay_state(path, state)
+    if lock_token:
+        link_lock_to_overlay(lock_token, path)
 
 
 def process_exists(pid: int | None) -> bool:
@@ -847,6 +1134,23 @@ def configure_layered_colorkey(hwnd: int, color: str) -> None:
     ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, colorref_from_hex(color), 0, LWA_COLORKEY)
 
 
+def set_window_region(hwnd: int, width: int, height: int) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+    except Exception:
+        return
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    create_rect_rgn = gdi32.CreateRectRgn
+    create_rect_rgn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    create_rect_rgn.restype = ctypes.c_void_p
+    region = create_rect_rgn(0, 0, max(1, int(width)), max(1, int(height)))
+    if region:
+        user32.SetWindowRgn(hwnd, region, True)
+
+
 def show_overlay_window(
     payload: dict[str, Any],
     auto_close: float | None,
@@ -913,12 +1217,13 @@ def show_overlay_window(
 
     def apply_window_geometry(force: bool = False) -> None:
         is_working = current["payload"].get("phase") == "working"
-        target_height = 12 if is_working else screen_height
+        target_height = 4 if is_working else screen_height
         signature = (screen_width, target_height, is_working)
         if not force and layout["signature"] == signature:
             return
         root.geometry(f"{screen_width}x{target_height}+0+0")
         root.update_idletasks()
+        set_window_region(root.winfo_id(), screen_width, target_height)
         layout["signature"] = signature
 
     def sync_clickthrough() -> None:
@@ -987,6 +1292,12 @@ def show_overlay_window(
                 if root.winfo_exists():
                     root.destroy()
                 return
+            if overlay_is_stale(next_payload):
+                dismissed["reason"] = "session-stale"
+                remove_overlay_state(state_file)
+                if root.winfo_exists():
+                    root.destroy()
+                return
             current["payload"] = next_payload
             root.title(current["payload"].get("title") or "UI Worker Finished")
             apply_window_geometry()
@@ -1009,51 +1320,95 @@ def show_overlay_window(
         glow_palette = overlay_palette(overlay_phase, status)
         border_wave = motion_now["borderWave"]
         glow_boost = motion_now["glowBoost"]
-        top_edge = 2.6
-        edge_hot = glass_edge_tint(glow_palette, phase["value"] + 0.04, blend_base, 0.94, 0.58)
-        edge_warm = glass_edge_tint(glow_palette, phase["value"] + 0.16, blend_base, 0.46, 0.72)
-        edge_cool = glass_edge_tint(glow_palette, phase["value"] + 0.28, blend_base, 0.18, 0.84)
-        edge_haze = glass_edge_tint(glow_palette, phase["value"] + 0.36, blend_base, 0.07, 0.9)
-        draw_fluid_top_border(
-            canvas,
-            4.0,
-            width - 4.0,
-            top_edge + (border_wave * 0.05),
-            phase=phase["value"],
-            width=max(1.8, 2.2 * glow_boost),
-            color=edge_hot,
-        )
-        draw_fluid_top_border(
-            canvas,
-            5.5,
-            width - 5.5,
-            top_edge + 1.05 + (border_wave * 0.032),
-            phase=phase["value"] + 0.05,
-            width=max(1.15, 1.45 * glow_boost),
-            color=edge_warm,
-        )
-        draw_fluid_top_border(
-            canvas,
-            7.0,
-            width - 7.0,
-            top_edge + 2.0 + (border_wave * 0.018),
-            phase=phase["value"] + 0.11,
-            width=max(0.75, 0.88 * glow_boost),
-            color=edge_cool,
-        )
-        draw_fluid_top_border(
-            canvas,
-            8.5,
-            width - 8.5,
-            top_edge + 3.1 + (border_wave * 0.01),
-            phase=phase["value"] + 0.16,
-            width=max(0.45, 0.52 * glow_boost),
-            color=edge_haze,
-        )
+        is_working = overlay_phase == "working"
+        if is_working:
+            top_edge = 0.35
+            edge_hot = glass_edge_tint(glow_palette, phase["value"] + 0.04, blend_base, 0.96, 0.56)
+            edge_warm = glass_edge_tint(glow_palette, phase["value"] + 0.16, blend_base, 0.54, 0.68)
+            edge_cool = glass_edge_tint(glow_palette, phase["value"] + 0.28, blend_base, 0.28, 0.82)
+            edge_haze = glass_edge_tint(glow_palette, phase["value"] + 0.36, blend_base, 0.12, 0.88)
+            draw_fluid_top_border(
+                canvas,
+                2.0,
+                width - 2.0,
+                top_edge + (border_wave * 0.012),
+                phase=phase["value"],
+                width=max(0.9, 1.15 * glow_boost),
+                color=edge_hot,
+            )
+            draw_fluid_top_border(
+                canvas,
+                3.0,
+                width - 3.0,
+                top_edge + 0.55 + (border_wave * 0.009),
+                phase=phase["value"] + 0.05,
+                width=max(0.65, 0.88 * glow_boost),
+                color=edge_warm,
+            )
+            draw_fluid_top_border(
+                canvas,
+                4.0,
+                width - 4.0,
+                top_edge + 1.08 + (border_wave * 0.006),
+                phase=phase["value"] + 0.11,
+                width=max(0.45, 0.65 * glow_boost),
+                color=edge_cool,
+            )
+            draw_fluid_top_border(
+                canvas,
+                5.0,
+                width - 5.0,
+                top_edge + 1.62 + (border_wave * 0.004),
+                phase=phase["value"] + 0.16,
+                width=max(0.28, 0.42 * glow_boost),
+                color=edge_haze,
+            )
+        else:
+            top_edge = 2.6
+            edge_hot = glass_edge_tint(glow_palette, phase["value"] + 0.04, blend_base, 0.94, 0.58)
+            edge_warm = glass_edge_tint(glow_palette, phase["value"] + 0.16, blend_base, 0.46, 0.72)
+            edge_cool = glass_edge_tint(glow_palette, phase["value"] + 0.28, blend_base, 0.18, 0.84)
+            edge_haze = glass_edge_tint(glow_palette, phase["value"] + 0.36, blend_base, 0.07, 0.9)
+            draw_fluid_top_border(
+                canvas,
+                4.0,
+                width - 4.0,
+                top_edge + (border_wave * 0.05),
+                phase=phase["value"],
+                width=max(1.8, 2.2 * glow_boost),
+                color=edge_hot,
+            )
+            draw_fluid_top_border(
+                canvas,
+                5.5,
+                width - 5.5,
+                top_edge + 1.05 + (border_wave * 0.032),
+                phase=phase["value"] + 0.05,
+                width=max(1.15, 1.45 * glow_boost),
+                color=edge_warm,
+            )
+            draw_fluid_top_border(
+                canvas,
+                7.0,
+                width - 7.0,
+                top_edge + 2.0 + (border_wave * 0.018),
+                phase=phase["value"] + 0.11,
+                width=max(0.75, 0.88 * glow_boost),
+                color=edge_cool,
+            )
+            draw_fluid_top_border(
+                canvas,
+                8.5,
+                width - 8.5,
+                top_edge + 3.1 + (border_wave * 0.01),
+                phase=phase["value"] + 0.16,
+                width=max(0.45, 0.52 * glow_boost),
+                color=edge_haze,
+            )
 
         top_y = max(60, int(height * 0.1)) + motion_now["offsetY"]
 
-        if overlay_phase == "working":
+        if is_working:
             return
 
         completed = payload_now["completed"]
@@ -1653,7 +2008,8 @@ def command_find_image(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_overlay(args: argparse.Namespace) -> dict[str, Any]:
     payload = load_overlay_payload(args)
-    state_file = Path(args.state_file).expanduser() if getattr(args, "state_file", None) else default_overlay_state_file()
+    explicit_state_file = Path(args.state_file).expanduser() if getattr(args, "state_file", None) else None
+    state_file = resolve_overlay_state_file(explicit_state_file)
     if args.mode == "start":
         payload["phase"] = "working"
         payload["status"] = "success"
@@ -1663,6 +2019,13 @@ def command_overlay(args: argparse.Namespace) -> dict[str, Any]:
             payload["summary"] = "Codex is controlling the screen."
     elif args.mode in {"finish", "show"}:
         payload["phase"] = "done"
+    now = time.time()
+    thread_id = current_codex_thread_id()
+    if args.mode in {"start", "finish"}:
+        payload["updatedAt"] = now
+        payload["activityAt"] = now
+        if thread_id:
+            payload["threadId"] = thread_id
     if args.dry_run:
         return ok(action="overlay", mode=args.mode, payload=payload, stateFile=str(state_file), dryRun=True)
     if args.mode == "watch":
@@ -1680,19 +2043,39 @@ def command_overlay(args: argparse.Namespace) -> dict[str, Any]:
         return ok(action="overlay", mode=args.mode, stateFile=str(state_file), closed=True)
     if args.mode == "start":
         existing = read_overlay_state(state_file) or {}
+        if existing and not overlay_state_matches_current_thread(existing):
+            existing = {}
+        if existing and overlay_is_stale(existing):
+            remove_overlay_state(state_file)
+            existing = {}
         watcher_pid = existing.get("watcherPid") if process_exists(existing.get("watcherPid")) else None
-        write_overlay_state(state_file, {**payload, "watcherPid": watcher_pid, "updatedAt": time.time()})
+        existing_lock_hash = str(existing.get("lockTokenHash") or "").strip()
+        overlay_payload = {**existing, **payload, "watcherPid": watcher_pid}
+        if existing_lock_hash:
+            overlay_payload["lockTokenHash"] = existing_lock_hash
+        if "startedAt" not in overlay_payload:
+            overlay_payload["startedAt"] = now
+        write_overlay_state(state_file, overlay_payload)
+        write_overlay_state_pointer(state_file)
         if not watcher_pid:
             watcher_pid = launch_overlay_watcher(state_file)
-            write_overlay_state(state_file, {**payload, "watcherPid": watcher_pid, "updatedAt": time.time()})
+            overlay_payload["watcherPid"] = watcher_pid
+            write_overlay_state(state_file, overlay_payload)
+            write_overlay_state_pointer(state_file)
         return ok(action="overlay", mode=args.mode, payload=payload, stateFile=str(state_file), watcherPid=watcher_pid)
     if args.mode == "finish":
         existing = read_overlay_state(state_file) or {}
+        if existing and not overlay_state_matches_current_thread(existing):
+            existing = {}
         watcher_pid = existing.get("watcherPid") if process_exists(existing.get("watcherPid")) else None
-        write_overlay_state(state_file, {**payload, "watcherPid": watcher_pid, "updatedAt": time.time()})
+        overlay_payload = {**existing, **payload, "watcherPid": watcher_pid}
+        write_overlay_state(state_file, overlay_payload)
+        write_overlay_state_pointer(state_file)
         if not watcher_pid:
             watcher_pid = launch_overlay_watcher(state_file)
-            write_overlay_state(state_file, {**payload, "watcherPid": watcher_pid, "updatedAt": time.time()})
+            overlay_payload["watcherPid"] = watcher_pid
+            write_overlay_state(state_file, overlay_payload)
+            write_overlay_state_pointer(state_file)
         return ok(action="overlay", mode=args.mode, payload=payload, stateFile=str(state_file), watcherPid=watcher_pid)
     raise RuntimeError(f"unsupported overlay mode: {args.mode}")
 
@@ -1896,6 +2279,7 @@ def command_lock(args: argparse.Namespace) -> dict[str, Any]:
     if args.lock_command == "acquire":
         owner = args.owner or f"pid:{os.getpid()} ui-worker"
         record = acquire_ui_lock(args.timeout, args.ttl, owner)
+        touch_overlay_activity(lock_token=str(record.get("token") or ""))
         return ok(
             action="lock-acquire",
             token=record["token"],

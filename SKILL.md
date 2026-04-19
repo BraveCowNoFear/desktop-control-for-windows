@@ -81,11 +81,10 @@ Worker loop:
 ## Decision Rules
 
 - Prefer normal APIs, CLI commands, browser automation, or app-specific tooling when they exist and are reliable.
+- For browser or website tasks, default to the already signed-in Microsoft Edge session first. Only switch to another browser if Edge is unavailable, the site is incompatible, or the user explicitly asks for a different browser.
 - For live Windows UI control, apply the mandatory delegation gate before any screenshot, image inspection, or `scripts/ui_control.py` call.
 - Use `scripts/ui_control.py` for fast local Windows control: hotkeys, text paste/type, mouse click, drag, scroll, screenshots, clipboard, window activation, pixel checks, image matching, and action plans.
-- Take a screenshot before acting unless the target coordinates/state are already known from the same interaction loop.
-- Use hotkeys and clipboard paste before mouse navigation when it is faster and safer.
-- Batch known actions with `plan` for speed, but keep visual decision loops stepwise: screenshot, inspect, act, verify.
+- Default to the fastest reliable path. When the target and intended input are already known, prefer hotkeys, global search, clipboard paste, and batched `plan` actions; add screenshot verification only when state is uncertain, an action could misfire, or the step is high-risk.
 - For localized apps such as WeChat, decide whether the visible UI is Chinese or English before searching. Use `--decode-unicode-escapes` for Chinese labels/messages in nested worker contexts; never rely on raw Chinese text surviving prompt, CLI, PowerShell, or log redirection layers.
 
 ## Local Control
